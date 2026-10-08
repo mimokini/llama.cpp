@@ -75,7 +75,7 @@ jobs:
 
     - name: Upload artifact
       if: steps.check_updates.outputs.has_updates == 'true'
-      uses: actions/upload-artifact@v5
+      uses: actions/upload-artifact@v6
       with:
         name: llama-server-s905x3-arm64
         path: build/bin/llama-server
