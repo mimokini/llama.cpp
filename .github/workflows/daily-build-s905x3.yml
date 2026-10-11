@@ -38,6 +38,7 @@ jobs:
     - name: Sync master with upstream
       if: steps.check_updates.outputs.has_updates == 'true'
       run: |
+        git remote set-url origin https://x-access-token:${{ secrets.MY_PAT }}@github.com/${{ github.repository }}.git
         git checkout -B master upstream/master
         git push --force origin master
 
