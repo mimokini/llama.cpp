@@ -80,13 +80,13 @@ jobs:
         if: steps.check_updates.outputs.has_updates == 'true'
         run: |
           sudo apt-get update
-          # 优化：安装 Ninja 构建工具，并明确安装 GCC 14
+          # 安装 Ninja 构建工具，并明确安装 GCC 14
           sudo apt-get install -y build-essential cmake git ninja-build gcc-14 g++-14 libcurl4-openssl-dev
 
       - name: Configure CMake
         if: steps.check_updates.outputs.has_updates == 'true'
         run: |
-          # 优化：使用 Ninja 生成器，强制指定 GCC 14
+          # 使用 Ninja 生成器，强制指定 GCC 14，开启多核 OpenMP 与 IPO
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=gcc-14 \
@@ -102,8 +102,9 @@ jobs:
             -DGGML_CPU_ARM_ARCH="armv8.2-a+dotprod+fp16" \
             -DGGML_CPU_KLEIDIAI=ON \
             -DGGML_LTO=ON \
-            -DGGML_OPENMP=OFF \
+            -DGGML_OPENMP=ON \
             -DGGML_CCACHE=OFF \
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
             -DCMAKE_C_FLAGS_RELEASE="-march=armv8.2-a+dotprod+fp16 -O3" \
             -DCMAKE_CXX_FLAGS_RELEASE="-march=armv8.2-a+dotprod+fp16 -O3"
 
