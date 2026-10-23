@@ -2,11 +2,13 @@ name: Daily Build llama.cpp for S905X3 (ARM64)
 
 on:
   schedule:
-    - cron: '17 2 * * *'          # 避开整点高峰，减少被丢弃的概率
+    # 避开整点高峰，降低 GitHub 调度延迟或丢包的几率
+    - cron: '17 2 * * *'
   workflow_dispatch:
+    # 允许手动触发，且手动触发时无视“无更新”检查，强制编译
 
 permissions:
-  contents: read                   # 降低默认 GITHUB_TOKEN 权限，推送用 PAT
+  contents: read  # 降低默认 GITHUB_TOKEN 权限，推送动作将由 PAT 完成
 
 jobs:
   preflight:
@@ -38,7 +40,7 @@ jobs:
           fetch-depth: 0
           ref: master
           token: ${{ secrets.MY_PAT }}
-          persist-credentials: false   # 不让 checkout 的 GITHUB_TOKEN 覆盖 PAT
+          persist-credentials: false   # 禁止 checkout 写入默认凭证，避免覆盖后续的 PAT 认证
 
       - name: Configure git auth explicitly
         env:
@@ -49,14 +51,19 @@ jobs:
       - name: Add upstream remote
         run: |
           git remote add upstream https://github.com/ggml-org/llama.cpp.git
-          git fetch upstream
+          # 优化：只拉取 master 分支，避免拉取海量无关分支和 tag，节省时间
+          git fetch upstream master
 
       - name: Check for upstream updates
         id: check_updates
         run: |
           LOCAL=$(git rev-parse HEAD)
           UPSTREAM=$(git rev-parse upstream/master)
-          if [ "$LOCAL" != "$UPSTREAM" ]; then
+          echo "Local HEAD: $LOCAL"
+          echo "Upstream HEAD: $UPSTREAM"
+          
+          # 优化：如果是手动触发 (workflow_dispatch)，或者代码确实有更新，都允许进行构建
+          if [ "$LOCAL" != "$UPSTREAM" ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             echo "has_updates=true" >> $GITHUB_OUTPUT
           else
             echo "has_updates=false" >> $GITHUB_OUTPUT
@@ -65,6 +72,7 @@ jobs:
       - name: Sync master with upstream
         if: steps.check_updates.outputs.has_updates == 'true'
         run: |
+          # 强制对齐到上游，此操作需要 PAT 具备 workflows:write 权限
           git checkout -B master upstream/master
           git push --force origin master
 
@@ -72,11 +80,13 @@ jobs:
         if: steps.check_updates.outputs.has_updates == 'true'
         run: |
           sudo apt-get update
+          # 优化：安装 Ninja 构建工具，并明确安装 GCC 14
           sudo apt-get install -y build-essential cmake git ninja-build gcc-14 g++-14 libcurl4-openssl-dev
 
       - name: Configure CMake
         if: steps.check_updates.outputs.has_updates == 'true'
         run: |
+          # 优化：使用 Ninja 生成器，强制指定 GCC 14
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER=gcc-14 \
@@ -99,7 +109,8 @@ jobs:
 
       - name: Build llama-server
         if: steps.check_updates.outputs.has_updates == 'true'
-        run: cmake --build build --config Release -j $(nproc) --target llama-server
+        run: |
+          cmake --build build --config Release -j $(nproc) --target llama-server
 
       - name: Upload artifact
         if: steps.check_updates.outputs.has_updates == 'true'
