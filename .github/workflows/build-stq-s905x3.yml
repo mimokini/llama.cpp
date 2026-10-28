@@ -1,68 +1,108 @@
 name: Manual Build llama.cpp STQ for S905X3 (ARM64)
 
-# 只保留手动触发，不做每日自动运行
 on:
   workflow_dispatch:
     inputs:
-      pr_ref:
-        description: 'PR ref to build (GitHub pull ref)'
+      stq_pr_ref:
+        description: 'STQ PR ref to cherry-pick'
         required: false
         default: 'pull/22836/head'
-      fallback_ref:
+      stq_fallback_ref:
         description: 'Fallback ref if PR ref fails (author branch)'
         required: false
         default: 'sjl623/stq1_0'
+      base_ref:
+        description: 'Base ref to build on (must include MiniCPM5 support)'
+        required: false
+        default: 'master'
 
 permissions:
-  contents: read   # 纯构建，不推送，不需要写权限
+  contents: read
 
 jobs:
   build-stq:
     runs-on: ubuntu-24.04-arm
 
     steps:
-      - name: Checkout repository (for workflow context only)
+      - name: Checkout repository (workflow context only)
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          persist-credentials: false   # 不需要 push，禁止写入凭证
+          persist-credentials: false
 
-      - name: Add upstream and PR author remotes
+      - name: Add remotes
         run: |
           git remote add upstream https://github.com/ggml-org/llama.cpp.git || true
           git remote add sjl623   https://github.com/sjl623/llama.cpp.git   || true
           git remote -v
 
-      - name: Fetch PR #22836 source (with fallback)
-        id: fetch_src
+      # ---------- 1. 基于最新 master 创建构建分支 ----------
+      - name: Create build branch from latest upstream base
+        id: base
         run: |
-          PR_REF="${{ github.event.inputs.pr_ref }}"
-          FALLBACK_REF="${{ github.event.inputs.fallback_ref }}"
+          BASE_REF="${{ github.event.inputs.base_ref }}"
+          echo "== Fetching upstream ${BASE_REF} =="
+          git fetch upstream "${BASE_REF}"
+          git checkout -B stq-build FETCH_HEAD
+          echo "base_commit=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "✅ Base: $(git rev-parse --short HEAD)  $(git log -1 --pretty=%s)"
+
+      # ---------- 2. 获取 STQ PR 的提交，cherry-pick 到最新 master 上 ----------
+      - name: Fetch STQ PR source (with fallback)
+        id: fetch_stq
+        run: |
+          STQ_PR_REF="${{ github.event.inputs.stq_pr_ref }}"
+          FALLBACK_REF="${{ github.event.inputs.stq_fallback_ref }}"
           FALLBACK_REMOTE="${FALLBACK_REF%%/*}"
           FALLBACK_BRANCH="${FALLBACK_REF#*/}"
 
-          echo "== Trying official PR ref: upstream ${PR_REF} =="
-          if git fetch upstream "${PR_REF}:refs/heads/stq-build" 2>/dev/null; then
-            echo "source=pr"       >> $GITHUB_OUTPUT
-            echo "branch=stq-build" >> $GITHUB_OUTPUT
-            echo "✅ Fetched ${PR_REF} into branch stq-build"
+          echo "== Trying official PR ref: upstream ${STQ_PR_REF} =="
+          if git fetch upstream "${STQ_PR_REF}:refs/heads/stq-source" 2>/dev/null; then
+            echo "source=pr" >> $GITHUB_OUTPUT
+            echo "✅ Fetched ${STQ_PR_REF} into stq-source"
           else
             echo "⚠️ PR ref fetch failed, trying ${FALLBACK_REF}"
-            git fetch "${FALLBACK_REMOTE}" "${FALLBACK_BRANCH}:refs/heads/stq-build"
-            echo "source=fallback"  >> $GITHUB_OUTPUT
-            echo "branch=stq-build" >> $GITHUB_OUTPUT
-            echo "✅ Fetched ${FALLBACK_REF} into branch stq-build"
+            git fetch "${FALLBACK_REMOTE}" "${FALLBACK_BRANCH}:refs/heads/stq-source"
+            echo "source=fallback" >> $GITHUB_OUTPUT
+            echo "✅ Fetched ${FALLBACK_REF} into stq-source"
           fi
 
-      - name: Checkout STQ source branch
+      - name: Cherry-pick STQ commits onto latest master
         run: |
-          git checkout -f "${{ steps.fetch_src.outputs.branch }}"
-          echo "=========================================="
-          echo "Source:   ${{ steps.fetch_src.outputs.source }}"
-          echo "Commit:   $(git rev-parse --short HEAD)"
-          echo "Subject:  $(git log -1 --pretty=%s)"
-          echo "=========================================="
+          set -e
+          echo "== STQ source: $(git log -1 --pretty='%h %s' stq-source) =="
 
+          # 计算 STQ 分支相对于其 merge-base 的提交范围
+          MERGE_BASE=$(git merge-base stq-build stq-source)
+          echo "Merge base: ${MERGE_BASE:0:7}"
+
+          COMMITS=$(git log --oneline --reverse "${MERGE_BASE}..stq-source")
+          COUNT=$(echo "$COMMITS" | wc -l)
+          echo "Commits to cherry-pick: $COUNT"
+          echo "$COMMITS"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No commits found between base and STQ source"
+            exit 1
+          fi
+
+          # 逐个 cherry-pick
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            SHA=$(echo "$line" | awk '{print $1}')
+            echo "Cherry-picking ${SHA} ..."
+            if ! git cherry-pick "$SHA"; then
+              echo "::error::Cherry-pick failed at ${SHA}. Likely conflict with newer master."
+              echo "Resolve manually or choose a different base_ref."
+              git cherry-pick --abort || true
+              exit 1
+            fi
+          done <<< "$COMMITS"
+
+          echo "✅ All STQ commits applied onto $(git rev-parse --short HEAD)"
+          echo "Final commit: $(git log -1 --pretty='%h %s')"
+
+      # ---------- 3. 编译 ----------
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -71,7 +111,6 @@ jobs:
             gcc-14 g++-14 libcurl4-openssl-dev
 
       - name: Configure CMake (STQ kernel, S905X3 optimized)
-        # 与每日构建保持一致的 ARMv8.2-a + dotprod + fp16 + KleidiAI 优化
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -98,17 +137,27 @@ jobs:
         run: |
           cmake --build build --config Release -j $(nproc) --target llama-server
 
-      - name: Verify STQ symbols
+      - name: Verify STQ and MiniCPM5 readiness
         run: |
           echo "=== Binary info ==="
           ls -lh build/bin/llama-server
           file build/bin/llama-server
+
           echo ""
-          echo "=== STQ1_0 symbol check (heuristic) ==="
+          echo "=== STQ1_0 symbol check ==="
           if strings build/bin/llama-server | grep -Eqi "stq1_0|stq_0"; then
-            echo "✅ STQ1_0 symbols found in binary"
+            echo "✅ STQ1_0 symbols found"
           else
-            echo "⚠️ STQ symbols not found by strings; verify manually with 1.25Bit model"
+            echo "⚠️ STQ symbols not found by strings"
+          fi
+
+          echo ""
+          echo "=== MiniCPM5 tokenizer/parser readiness ==="
+          # MiniCPM5 pre-tokenizer 通常在 llama-vocab.cpp 中以 "minicpm5" 字样出现
+          if strings build/bin/llama-server | grep -qi "minicpm5"; then
+            echo "✅ MiniCPM5 related strings found (tokenizer/parser likely present)"
+          else
+            echo "⚠️ No MiniCPM5 strings found; base_ref may be too old for MiniCPM5 support"
           fi
 
       - name: Upload artifact
