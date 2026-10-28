@@ -114,7 +114,40 @@ jobs:
           echo ""
           echo "✅ All commits applied. Final: $(git log -1 --pretty='%h %s')"
 
-      # ---------- 4. 编译 ----------
+      # ---------- 4. 修补 GGML_TYPE_COUNT（关键：避免张量类型越界） ----------
+      - name: Fix GGML_TYPE_COUNT for STQ1_0
+        run: |
+          set -e
+          TYPE_HEADER="ggml/include/ggml.h"
+
+          echo "== Before fix =="
+          grep -n "GGML_TYPE_COUNT" "$TYPE_HEADER" || true
+          grep -n "GGML_TYPE_STQ1_0" "$TYPE_HEADER" || true
+
+          # 取出 STQ1_0 的枚举值（去掉尾部逗号）
+          STQ_VALUE=$(grep -E "GGML_TYPE_STQ1_0\s*=" "$TYPE_HEADER" | head -1 | sed -E 's/.*=\s*([0-9]+).*/\1/')
+          COUNT_VALUE=$(grep -E "GGML_TYPE_COUNT\s*=" "$TYPE_HEADER" | head -1 | sed -E 's/.*=\s*([0-9]+).*/\1/')
+          echo "STQ1_0 value = ${STQ_VALUE:-<missing>}"
+          echo "GGML_TYPE_COUNT value = ${COUNT_VALUE:-<missing>}"
+
+          if [ -z "${STQ_VALUE:-}" ]; then
+            echo "::error::GGML_TYPE_STQ1_0 not found in $TYPE_HEADER; cherry-pick may have failed"
+            exit 1
+          fi
+
+          # 目标：COUNT 必须 > STQ 值。否则把 COUNT 设为 STQ+1
+          EXPECTED=$((STQ_VALUE + 1))
+          if [ -z "${COUNT_VALUE:-}" ] || [ "$COUNT_VALUE" -le "$STQ_VALUE" ]; then
+            echo "→ Adjusting GGML_TYPE_COUNT to $EXPECTED"
+            sed -i -E "s/GGML_TYPE_COUNT\s*=\s*[0-9]+/GGML_TYPE_COUNT = ${EXPECTED}/" "$TYPE_HEADER"
+          else
+            echo "→ GGML_TYPE_COUNT ($COUNT_VALUE) already > STQ1_0 ($STQ_VALUE), no change needed"
+          fi
+
+          echo "== After fix =="
+          grep -n "GGML_TYPE_COUNT" "$TYPE_HEADER" || true
+
+      # ---------- 5. 编译 ----------
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -149,7 +182,7 @@ jobs:
         run: |
           cmake --build build --config Release -j $(nproc) --target llama-server
 
-      - name: Verify STQ and MiniCPM5 readiness
+      - name: Verify STQ, MiniCPM5 and TYPE_COUNT readiness
         run: |
           echo "=== Binary info ==="
           ls -lh build/bin/llama-server
@@ -170,6 +203,10 @@ jobs:
           else
             echo "⚠️ No MiniCPM5 strings found; base_ref may be too old for MiniCPM5 support"
           fi
+
+          echo ""
+          echo "=== GGML_TYPE_COUNT check (post-build source) ==="
+          grep -n "GGML_TYPE_COUNT" ggml/include/ggml.h || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
