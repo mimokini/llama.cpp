@@ -1,0 +1,119 @@
+name: Manual Build llama.cpp STQ for S905X3 (ARM64)
+
+# 只保留手动触发，不做每日自动运行
+on:
+  workflow_dispatch:
+    inputs:
+      pr_ref:
+        description: 'PR ref to build (GitHub pull ref)'
+        required: false
+        default: 'pull/22836/head'
+      fallback_ref:
+        description: 'Fallback ref if PR ref fails (author branch)'
+        required: false
+        default: 'sjl623/stq1_0'
+
+permissions:
+  contents: read   # 纯构建，不推送，不需要写权限
+
+jobs:
+  build-stq:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout repository (for workflow context only)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false   # 不需要 push，禁止写入凭证
+
+      - name: Add upstream and PR author remotes
+        run: |
+          git remote add upstream https://github.com/ggml-org/llama.cpp.git || true
+          git remote add sjl623   https://github.com/sjl623/llama.cpp.git   || true
+          git remote -v
+
+      - name: Fetch PR #22836 source (with fallback)
+        id: fetch_src
+        run: |
+          PR_REF="${{ github.event.inputs.pr_ref }}"
+          FALLBACK_REF="${{ github.event.inputs.fallback_ref }}"
+          FALLBACK_REMOTE="${FALLBACK_REF%%/*}"
+          FALLBACK_BRANCH="${FALLBACK_REF#*/}"
+
+          echo "== Trying official PR ref: upstream ${PR_REF} =="
+          if git fetch upstream "${PR_REF}:refs/heads/stq-build" 2>/dev/null; then
+            echo "source=pr"       >> $GITHUB_OUTPUT
+            echo "branch=stq-build" >> $GITHUB_OUTPUT
+            echo "✅ Fetched ${PR_REF} into branch stq-build"
+          else
+            echo "⚠️ PR ref fetch failed, trying ${FALLBACK_REF}"
+            git fetch "${FALLBACK_REMOTE}" "${FALLBACK_BRANCH}:refs/heads/stq-build"
+            echo "source=fallback"  >> $GITHUB_OUTPUT
+            echo "branch=stq-build" >> $GITHUB_OUTPUT
+            echo "✅ Fetched ${FALLBACK_REF} into branch stq-build"
+          fi
+
+      - name: Checkout STQ source branch
+        run: |
+          git checkout -f "${{ steps.fetch_src.outputs.branch }}"
+          echo "=========================================="
+          echo "Source:   ${{ steps.fetch_src.outputs.source }}"
+          echo "Commit:   $(git rev-parse --short HEAD)"
+          echo "Subject:  $(git log -1 --pretty=%s)"
+          echo "=========================================="
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake git ninja-build \
+            gcc-14 g++-14 libcurl4-openssl-dev
+
+      - name: Configure CMake (STQ kernel, S905X3 optimized)
+        # 与每日构建保持一致的 ARMv8.2-a + dotprod + fp16 + KleidiAI 优化
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-14 \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_CURL=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_CPU=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=OFF \
+            -DGGML_CPU_ARM_ARCH="armv8.2-a+dotprod+fp16" \
+            -DGGML_CPU_KLEIDIAI=ON \
+            -DGGML_LTO=ON \
+            -DGGML_OPENMP=ON \
+            -DGGML_CCACHE=OFF \
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+            -DCMAKE_C_FLAGS_RELEASE="-march=armv8.2-a+dotprod+fp16 -O3" \
+            -DCMAKE_CXX_FLAGS_RELEASE="-march=armv8.2-a+dotprod+fp16 -O3"
+
+      - name: Build llama-server
+        run: |
+          cmake --build build --config Release -j $(nproc) --target llama-server
+
+      - name: Verify STQ symbols
+        run: |
+          echo "=== Binary info ==="
+          ls -lh build/bin/llama-server
+          file build/bin/llama-server
+          echo ""
+          echo "=== STQ1_0 symbol check (heuristic) ==="
+          if strings build/bin/llama-server | grep -Eqi "stq1_0|stq_0"; then
+            echo "✅ STQ1_0 symbols found in binary"
+          else
+            echo "⚠️ STQ symbols not found by strings; verify manually with 1.25Bit model"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-server-stq-s905x3-arm64
+          path: build/bin/llama-server
+          retention-days: 7
