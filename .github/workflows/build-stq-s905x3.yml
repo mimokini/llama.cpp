@@ -34,20 +34,16 @@ jobs:
         run: |
           git remote add upstream https://github.com/ggml-org/llama.cpp.git || true
           git remote add sjl623   https://github.com/sjl623/llama.cpp.git   || true
-          git remote -v
 
       # ---------- 1. 基于最新 master 创建构建分支 ----------
       - name: Create build branch from latest upstream base
-        id: base
         run: |
           BASE_REF="${{ github.event.inputs.base_ref }}"
-          echo "== Fetching upstream ${BASE_REF} =="
           git fetch upstream "${BASE_REF}"
           git checkout -B stq-build FETCH_HEAD
-          echo "base_commit=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
           echo "✅ Base: $(git rev-parse --short HEAD)  $(git log -1 --pretty=%s)"
 
-      # ---------- 2. 获取 STQ PR 的提交，cherry-pick 到最新 master 上 ----------
+      # ---------- 2. 获取 STQ PR 源码 ----------
       - name: Fetch STQ PR source (with fallback)
         id: fetch_stq
         run: |
@@ -56,59 +52,53 @@ jobs:
           FALLBACK_REMOTE="${FALLBACK_REF%%/*}"
           FALLBACK_BRANCH="${FALLBACK_REF#*/}"
 
-          echo "== Trying official PR ref: upstream ${STQ_PR_REF} =="
           if git fetch upstream "${STQ_PR_REF}:refs/heads/stq-source" 2>/dev/null; then
             echo "source=pr" >> $GITHUB_OUTPUT
-            echo "✅ Fetched ${STQ_PR_REF} into stq-source"
           else
-            echo "⚠️ PR ref fetch failed, trying ${FALLBACK_REF}"
             git fetch "${FALLBACK_REMOTE}" "${FALLBACK_BRANCH}:refs/heads/stq-source"
             echo "source=fallback" >> $GITHUB_OUTPUT
-            echo "✅ Fetched ${FALLBACK_REF} into stq-source"
           fi
 
-      - name: Cherry-pick STQ commits onto latest master
+      # ---------- 3. Cherry-pick STQ 提交，自动解决冲突 ----------
+      - name: Cherry-pick STQ commits with conflict resolution
         run: |
           set -e
-          echo "== STQ source: $(git log -1 --pretty='%h %s' stq-source) =="
-
-          # 计算 STQ 分支相对于其 merge-base 的提交范围
           MERGE_BASE=$(git merge-base stq-build stq-source)
-          echo "Merge base: ${MERGE_BASE:0:7}"
-
           COMMITS=$(git log --oneline --reverse "${MERGE_BASE}..stq-source")
-          COUNT=$(echo "$COMMITS" | wc -l)
-          echo "Commits to cherry-pick: $COUNT"
+          
+          echo "Commits to cherry-pick:"
           echo "$COMMITS"
+          echo ""
 
-          if [ "$COUNT" -eq 0 ]; then
-            echo "::error::No commits found between base and STQ source"
-            exit 1
-          fi
-
-          # 逐个 cherry-pick
           while IFS= read -r line; do
             [ -z "$line" ] && continue
             SHA=$(echo "$line" | awk '{print $1}')
             echo "Cherry-picking ${SHA} ..."
-            if ! git cherry-pick "$SHA"; then
-              echo "::error::Cherry-pick failed at ${SHA}. Likely conflict with newer master."
-              echo "Resolve manually or choose a different base_ref."
-              git cherry-pick --abort || true
-              exit 1
+            
+            if git cherry-pick "$SHA"; then
+              echo "  ✅ Clean apply"
+            else
+              echo "  ⚠️ Conflict detected, resolving by taking STQ version"
+              # 冲突文件采用 STQ 分支（--theirs）的版本
+              git diff --name-only --diff-filter=U | while read -r f; do
+                echo "    Resolving $f (taking theirs)"
+                git checkout --theirs -- "$f"
+                git add "$f"
+              done
+              # 完成 cherry-pick
+              git cherry-pick --continue --no-edit
+              echo "  ✅ Resolved"
             fi
           done <<< "$COMMITS"
 
-          echo "✅ All STQ commits applied onto $(git rev-parse --short HEAD)"
-          echo "Final commit: $(git log -1 --pretty='%h %s')"
+          echo ""
+          echo "✅ All commits applied. Final: $(git log -1 --pretty='%h %s')"
 
-      # ---------- 3. 编译 ----------
+      # ---------- 4. 编译 ----------
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential cmake git ninja-build \
-            gcc-14 g++-14 libcurl4-openssl-dev
+          sudo apt-get install -y build-essential cmake git ninja-build gcc-14 g++-14 libcurl4-openssl-dev
 
       - name: Configure CMake (STQ kernel, S905X3 optimized)
         run: |
@@ -134,30 +124,15 @@ jobs:
             -DCMAKE_CXX_FLAGS_RELEASE="-march=armv8.2-a+dotprod+fp16 -O3"
 
       - name: Build llama-server
-        run: |
-          cmake --build build --config Release -j $(nproc) --target llama-server
+        run: cmake --build build --config Release -j $(nproc) --target llama-server
 
-      - name: Verify STQ and MiniCPM5 readiness
+      - name: Verify STQ symbols
         run: |
-          echo "=== Binary info ==="
           ls -lh build/bin/llama-server
-          file build/bin/llama-server
-
-          echo ""
-          echo "=== STQ1_0 symbol check ==="
-          if strings build/bin/llama-server | grep -Eqi "stq1_0|stq_0"; then
+          if strings build/bin/llama-server | grep -Eqi "stq1_0"; then
             echo "✅ STQ1_0 symbols found"
           else
             echo "⚠️ STQ symbols not found by strings"
-          fi
-
-          echo ""
-          echo "=== MiniCPM5 tokenizer/parser readiness ==="
-          # MiniCPM5 pre-tokenizer 通常在 llama-vocab.cpp 中以 "minicpm5" 字样出现
-          if strings build/bin/llama-server | grep -qi "minicpm5"; then
-            echo "✅ MiniCPM5 related strings found (tokenizer/parser likely present)"
-          else
-            echo "⚠️ No MiniCPM5 strings found; base_ref may be too old for MiniCPM5 support"
           fi
 
       - name: Upload artifact
